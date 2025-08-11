@@ -224,14 +224,18 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
 async def _run_env_eval_impl(
     vllm_generation, dataloader, env, master_config, use_async=False
 ):
-    """Unified implementation for both sync and async evaluation."""
+    """Unified implementation for both sync and async evaluation with multiturn support."""
     # Extract for easier access
     generation_config = master_config["generation"]
     eval_config = master_config["eval"]
     metric = eval_config["metric"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     pass_k_value = eval_config["pass_k_value"]
-
+    # Get max turns from config, with fallback logic
+    env_config = master_config.get("env", {})
+    max_turns = env_config.get("bfcl_multiturn", {}).get("max_turns", 10)
+    print("env", env)
+    print("max_turns", max_turns)
     # List to collect evaluation data for parquet file
     evaluation_data = []
 
@@ -239,57 +243,124 @@ async def _run_env_eval_impl(
     score = 0.0
     for batch in dataloader:
         # measure multiple samples
+        #print("batch", batch)
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
-        # get input prompt from message_log
-        prompts = []
-        for message_log in batch["message_log"]:
-            content = [message["content"] for message in message_log]
-            content = "\n".join(content)
-            prompts.append(content)
+        # Initialize multiturn state
+        current_message_logs = batch["message_log"].copy()
+        current_metadata = batch["extra_env_info"].copy()
+        #print("current_metadata", current_metadata)
+        final_rewards = None
+        all_turns_data = []
+        
+        # Multiturn conversation loop
+        for turn in range(max_turns):
+            print(f"\n=== Turn {turn + 1} ===")                
+            # get input prompt from current message_log
+            prompts = []
+            print("length of current_message_logs", len(current_message_logs))
+            for message_log in current_message_logs:
+                content = [message["content"] for message in message_log]
+                content = "\n".join(content)
+                prompts.append(content)
+            print("prompts", prompts[0])
+            # generate by vllm
+            inputs = BatchedDataDict({"prompts": prompts})
+            outputs = await _generate_texts(vllm_generation, inputs, use_async)
 
-        # generate by vllm
-        inputs = BatchedDataDict({"prompts": prompts})
-        outputs = await _generate_texts(vllm_generation, inputs, use_async)
+            # append to message_log
+            for idx, output in enumerate(outputs):
+                current_message_logs[idx].append(
+                    {
+                        "role": "assistant",
+                        "content": output,
+                    }
+                )
 
-        # append to message_log
-        for idx, output in enumerate(outputs):
-            batch["message_log"][idx].append(
-                {
-                    "role": "assistant",
-                    "content": output,
-                }
-            )
+            # evaluate generations with the environment
+            to_env = [
+                get_keys_from_message_log(current_message_logs[i], ["role", "content"])
+                for i in range(len(current_message_logs))
+            ]
+            env_return = ray.get(env.step.remote(to_env, current_metadata))
+            #print("env return" , env_return)
+            print("0", env_return.terminateds[0])
+            print("rewards", env_return.rewards[0])
+            # Store turn data
+            turn_data = {
+                "turn": turn + 1,
+                "prompts": prompts.copy(),
+                "outputs": outputs.copy(),
+                "message_logs": [msg_log.copy() for msg_log in current_message_logs],
+                "rewards": env_return.rewards.clone(),
+                "terminateds": env_return.terminateds.clone(),
+            }
+            all_turns_data.append(turn_data)
+            
+            # Update final rewards (use latest rewards)
+            final_rewards = env_return.rewards #see if this is correct
+            
+            # Check if all episodes are terminated
+            if env_return.terminateds.all():
+                print(f"All episodes terminated at turn {turn + 1}")
+                break
+                
+            # Prepare for next turn - add user questions from user_question_bank
+            current_metadata = env_return.metadata
+            current_observations = env_return.observations
+            print("current_metadata", current_metadata[0])
+            print("observations ", env_return.observations[0])
+            print("length of loop", len(env_return.terminateds))
+            i =0 
+            for idx, terminated in enumerate(env_return.terminateds):
+                observation = current_observations[idx]
+                current_message_logs[idx].append(observation)
+                print("terminated", terminated)
+                print("turn_success", current_metadata[idx]['turn_success'])
+                if not terminated and current_metadata[idx]['turn_success']:
+                    print("not terminated")
+                    # Get user questions for the next turn from user_question_bank
+                    user_question_bank = current_metadata[idx].get("user_question_bank", [])
+                    if turn < len(user_question_bank):
+                        # Get questions for this turn (turn is 0-indexed)
+                        turn_questions = user_question_bank[turn]
+                        # Each turn has a single question (wrapped in a list)
+                        if turn_questions:
+                            question = turn_questions[0]
+                            current_message_logs[idx].append({
+                                "role": "user", 
+                                "content": question.get("content", "")
+                            })
+                    if i == 0:
+                        print("current_message_logs", current_message_logs[0])
+                        i=1
+        # Use final rewards for scoring
+        if final_rewards is not None:
+            rewards = final_rewards
+            print("Final rewards:", rewards)
+        else:
+            # Fallback in case no turns were executed
+            print("Warning: No rewards generated")
+            rewards = torch.zeros(len(batch["message_log"]), dtype=torch.float32)
 
-        # evaluate generations with the environment
-        to_env = [
-            get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
-            for i in range(len(batch["message_log"]))
-        ]
-        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
-        rewards = env_return.rewards
-
-        # Collect data for JSON file
-        for i, (prompt, output, message_log, reward, extra_info) in enumerate(
-            zip(
-                prompts,
-                outputs,
-                batch["message_log"],
-                rewards.tolist(),
-                batch["extra_env_info"],
-            )
-        ):
-            evaluation_data.append(
-                {
-                    "prompt": prompt,
-                    "response": output,
-                    "reward": reward,
+        # Collect data for JSON file - use final turn data
+        if all_turns_data:  # Safety check for empty turns
+            final_turn_data = all_turns_data[-1]  # Get the last turn
+            for i, (message_log, reward, extra_info) in enumerate(
+                zip(
+                    final_turn_data["message_logs"],
+                    rewards.tolist(),
+                    current_metadata,
+                )
+            ):
+                # Create comprehensive evaluation data including all turns
+                sample_data = {
+                    "final_reward": reward,
                     "message_log": message_log,
                     "extra_env_info": extra_info,
                     "sample_index": len(evaluation_data),
                 }
-            )
 
         # update stats
         if metric == "pass@k":
