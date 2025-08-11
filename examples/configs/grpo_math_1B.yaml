@@ -47,7 +47,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
   
@@ -129,6 +129,23 @@ data:
   system_prompt_file: null
   dataset_name: "OpenMathInstruct-2"
   shuffle: true
+  train:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: ...
+
+    # checks if it's too long on init
+    filter_long_samples: false
+    drop_last: True
+  val:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: ...
+    drop_last: False
+
+    # checks if it's too long on init
+    filter_long_samples: false
+
 
 env:
   math:

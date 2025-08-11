@@ -22,7 +22,7 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
+import json
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossConfig,
@@ -778,6 +778,15 @@ def grpo_train(
         log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
         log_data["input_lengths"] = input_lengths.tolist()
+        
+        # Add environment metadata for each sample. Serialise to JSON strings for safe logging.
+        try:
+            extra_env_info = repeated_batch["extra_env_info"]
+        except KeyError:
+            extra_env_info = [None] * len(rewards)
+
+        log_data["metadata"] = [json.dumps(m, default=str) if m is not None else "" for m in extra_env_info]
+
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
 
         metrics = {
